@@ -141,7 +141,9 @@ pub fn parse_bytes<R: BufRead, I: KPLItem>(
             continue;
         }
         map.entry(key).or_insert_with(|| I::default());
-        let body_map = map.get_mut(&key).unwrap();
+        let body_map = map
+            .get_mut(&key)
+            .expect("key was just inserted via or_insert_with so it always exists");
         body_map.parse(item);
     }
     Ok(map)
@@ -602,9 +604,16 @@ pub fn convert_fk_items(
         let parent_id = dataset.data[(*parent_idx) as usize].to;
 
         // Modify this EP.
-        let index = dataset.lut.by_id.get(&id).unwrap();
+        let index = dataset.lut.by_id.get(&id).ok_or(DataSetError::Conversion {
+            action: format!("frame {id} not found in lookup table after insertion"),
+        })?;
         // Grab the data
-        let this_q = dataset.data.get_mut(*index as usize).unwrap();
+        let this_q = dataset
+            .data
+            .get_mut(*index as usize)
+            .ok_or(DataSetError::Conversion {
+                action: format!("frame {id} data index {index} out of bounds"),
+            })?;
         this_q.to = parent_id;
     }
 

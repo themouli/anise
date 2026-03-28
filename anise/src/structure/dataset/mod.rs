@@ -117,7 +117,7 @@ impl<T: DataSetT> DataSet<T> {
     /// Forces to load an Anise file from a pointer of bytes.
     /// **Panics** if the bytes cannot be interpreted as an Anise file.
     pub fn from_bytes<B: Deref<Target = [u8]>>(buf: B) -> Self {
-        Self::try_from_bytes(buf).unwrap()
+        Self::try_from_bytes(buf).expect("bytes should be a valid Anise file")
     }
 
     /// Compute the CRC32 of the underlying bytes
@@ -449,11 +449,13 @@ impl<T: DataSetT> DataSet<T> {
         meta.push(self.data.len() as u32);
         for data in &self.data {
             let mut this_buf = vec![];
-            data.encode_to_vec(&mut this_buf).unwrap();
+            data.encode_to_vec(&mut this_buf)
+                .expect("DER encoding of data item should always succeed");
             meta.push(this_buf.len() as u32);
             buf.extend_from_slice(&this_buf);
         }
-        let bytes = OctetString::new(buf).unwrap();
+        let bytes =
+            OctetString::new(buf).expect("encoded data buffer is always a valid OctetString");
         (meta, bytes)
     }
 }
@@ -500,11 +502,20 @@ impl<'a, T: DataSetT> Decode<'a> for DataSet<T> {
         let mut data = vec![];
         let mut idx = 0;
         // The first element of bytes_meta is the number of data items.
-        for meta_idx in 0..*bytes_meta.first().unwrap() as usize {
+        let num_items = bytes_meta
+            .first()
+            .copied()
+            .ok_or_else(|| der::Error::new(der::ErrorKind::Failed, der::Length::ZERO))?
+            as usize;
+        for meta_idx in 0..num_items {
             // The subsequent elements are the lengths of each data item.
-            let next_len = *bytes_meta.get(meta_idx + 1).unwrap() as usize;
+            let next_len = bytes_meta
+                .get(meta_idx + 1)
+                .copied()
+                .ok_or_else(|| der::Error::new(der::ErrorKind::Failed, der::Length::ZERO))?
+                as usize;
             // Decode each data item from its slice of the bytes.
-            let this_data = T::from_der(&bytes[idx..idx + next_len]).unwrap();
+            let this_data = T::from_der(&bytes[idx..idx + next_len])?;
             data.push(this_data);
             idx += next_len;
         }
@@ -547,10 +558,11 @@ mod dataset_ut {
         let repr = DataSet::<SpacecraftData>::default();
 
         let mut buf = vec![];
-        repr.encode_to_vec(&mut buf).unwrap();
+        repr.encode_to_vec(&mut buf)
+            .expect("should encode empty DataSet to DER");
         assert_eq!(buf.len(), 63);
 
-        let repr_dec = DataSet::from_der(&buf).unwrap();
+        let repr_dec = DataSet::from_der(&buf).expect("should decode empty DataSet from DER");
 
         assert_eq!(repr, repr_dec);
 
@@ -587,7 +599,9 @@ mod dataset_ut {
         let mut packed_buf = [0; 1000];
 
         let mut this_buf = vec![];
-        full_sc.encode_to_vec(&mut this_buf).unwrap();
+        full_sc
+            .encode_to_vec(&mut this_buf)
+            .expect("should encode full_sc to DER");
         let end_idx = this_buf.len();
         // Build this entry data.
         let full_sc_entry = 0..end_idx;
@@ -597,18 +611,22 @@ mod dataset_ut {
             packed_buf[i] = *byte;
         }
         // Check that we can decode what we have copied so far
-        let full_sc_dec = SpacecraftData::from_der(&packed_buf[full_sc_entry]).unwrap();
+        let full_sc_dec = SpacecraftData::from_der(&packed_buf[full_sc_entry])
+            .expect("should decode full_sc from DER");
         assert_eq!(full_sc_dec, full_sc);
         // Encode the other entry
         let mut this_buf = vec![];
-        srp_sc.encode_to_vec(&mut this_buf).unwrap();
+        srp_sc
+            .encode_to_vec(&mut this_buf)
+            .expect("should encode srp_sc to DER");
         // Copy into the packed buffer
         for (i, byte) in this_buf.iter().enumerate() {
             packed_buf[i + end_idx] = *byte;
         }
         let srp_sc_entry = end_idx..end_idx + this_buf.len();
         // Check that we can decode the next entry
-        let srp_sc_dec = SpacecraftData::from_der(&packed_buf[srp_sc_entry]).unwrap();
+        let srp_sc_dec = SpacecraftData::from_der(&packed_buf[srp_sc_entry])
+            .expect("should decode srp_sc from DER");
         assert_eq!(srp_sc_dec, srp_sc);
         // Build the dataset
         let mut dataset = DataSet::default();
@@ -616,18 +634,21 @@ mod dataset_ut {
         // Build the lookup table
         dataset
             .push(srp_sc, Some(-20), Some("SRP spacecraft"))
-            .unwrap();
+            .expect("should push srp_sc with id -20");
         dataset
             .push(full_sc, Some(-50), Some("Full spacecraft"))
-            .unwrap();
+            .expect("should push full_sc with id -50");
 
         dataset.set_crc32();
 
         // And encode it.
         let mut buf = vec![];
-        dataset.encode_to_vec(&mut buf).unwrap();
+        dataset
+            .encode_to_vec(&mut buf)
+            .expect("should encode dataset to DER");
 
-        let repr_dec = DataSet::<SpacecraftData>::from_der(&buf).unwrap();
+        let repr_dec =
+            DataSet::<SpacecraftData>::from_der(&buf).expect("should decode dataset from DER");
 
         assert_eq!(dataset, repr_dec);
 
@@ -635,10 +656,14 @@ mod dataset_ut {
 
         // Now that the data is valid, let's fetch the data back
 
-        let full_sc_repr = repr_dec.get_by_id(-50).unwrap();
+        let full_sc_repr = repr_dec
+            .get_by_id(-50)
+            .expect("should get full_sc by id -50");
         assert_eq!(full_sc_repr, full_sc);
 
-        let srp_repr = repr_dec.get_by_id(-20).unwrap();
+        let srp_repr = repr_dec
+            .get_by_id(-20)
+            .expect("should get srp_sc by id -20");
         assert_eq!(srp_repr, srp_sc);
 
         // And check that we get an error if the data is wrong.
@@ -648,22 +673,33 @@ mod dataset_ut {
         let orig_dataset = dataset.clone();
 
         // Grab a copy of the original data
-        let mut sc = dataset.get_by_name("SRP spacecraft").unwrap();
-        sc.srp_data.as_mut().unwrap().coeff_reflectivity = 1.1;
-        dataset.set_by_name("SRP spacecraft", sc).unwrap();
+        let mut sc = dataset
+            .get_by_name("SRP spacecraft")
+            .expect("should get SRP spacecraft by name");
+        sc.srp_data
+            .as_mut()
+            .expect("srp_sc has srp_data set")
+            .coeff_reflectivity = 1.1;
+        dataset
+            .set_by_name("SRP spacecraft", sc)
+            .expect("should set SRP spacecraft by name");
         // Ensure that we've modified only that entry
         assert_eq!(
-            dataset.get_by_name("Full spacecraft").unwrap(),
-            orig_dataset.get_by_name("Full spacecraft").unwrap(),
+            dataset
+                .get_by_name("Full spacecraft")
+                .expect("should get Full spacecraft by name"),
+            orig_dataset
+                .get_by_name("Full spacecraft")
+                .expect("should get Full spacecraft from original dataset"),
             "immutable value was modified"
         );
         // Ensure that we've modified the entry we wanted to modify
         assert_eq!(
             dataset
                 .get_by_name("SRP spacecraft")
-                .unwrap()
+                .expect("should get modified SRP spacecraft by name")
                 .srp_data
-                .unwrap()
+                .expect("srp_sc has srp_data set")
                 .coeff_reflectivity,
             1.1,
             "value was not modified"
@@ -674,7 +710,7 @@ mod dataset_ut {
         dataset
             .lut
             .rename("SRP spacecraft", "Renamed SRP spacecraft")
-            .unwrap();
+            .expect("should rename SRP spacecraft");
         // Calling this a second time will lead to an error
         assert!(dataset
             .lut
@@ -686,9 +722,9 @@ mod dataset_ut {
         assert_eq!(
             dataset
                 .get_by_name("Renamed SRP spacecraft")
-                .unwrap()
+                .expect("should get renamed SRP spacecraft by name")
                 .srp_data
-                .unwrap()
+                .expect("renamed srp_sc has srp_data set")
                 .coeff_reflectivity,
             1.1,
             "value not reachable after rename"
@@ -731,26 +767,30 @@ mod dataset_ut {
         let mut dataset = DataSet::<SpacecraftData>::default();
         dataset
             .push(srp_sc, Some(-20), Some("SRP spacecraft"))
-            .unwrap();
+            .expect("should push srp_sc with id -20");
 
         dataset
             .push(full_sc, Some(-50), Some("Full spacecraft"))
-            .unwrap();
+            .expect("should push full_sc with id -50");
 
         // Pushing without name as ID -51
-        dataset.push(full_sc, Some(-51), None).unwrap();
+        dataset
+            .push(full_sc, Some(-51), None)
+            .expect("should push full_sc with id -51 and no name");
 
         // Pushing without ID
         dataset
             .push(srp_sc, None, Some("ID less SRP spacecraft"))
-            .unwrap();
+            .expect("should push srp_sc with no id");
 
         // Make sure to set the CRC32.
         dataset.set_crc32();
         // And encode it.
 
         let mut ebuf = vec![];
-        dataset.encode_to_vec(&mut ebuf).unwrap();
+        dataset
+            .encode_to_vec(&mut ebuf)
+            .expect("should encode dataset builder to DER");
 
         // assert_eq!(ebuf.len(), 506);
 
@@ -762,34 +802,55 @@ mod dataset_ut {
 
         // Now that the data is valid, let's fetch the data back
 
-        let full_sc_repr = repr_dec.get_by_id(-50).unwrap();
+        let full_sc_repr = repr_dec
+            .get_by_id(-50)
+            .expect("should get full_sc by id -50 from builder dataset");
         assert_eq!(full_sc_repr, full_sc);
 
-        let srp_repr = repr_dec.get_by_id(-20).unwrap();
+        let srp_repr = repr_dec
+            .get_by_id(-20)
+            .expect("should get srp_sc by id -20 from builder dataset");
         assert_eq!(srp_repr, srp_sc);
 
         // And check that we get an error if the data is wrong.
         assert!(repr_dec.get_by_id(0).is_err());
 
         // Check that we can set by ID
-        let mut repr = dataset.get_by_id(-50).unwrap();
-        repr.mass.as_mut().unwrap().dry_mass_kg = 100.5;
-        dataset.set_by_id(-50, repr).unwrap();
+        let mut repr = dataset
+            .get_by_id(-50)
+            .expect("should get full_sc by id -50 for modification");
+        repr.mass
+            .as_mut()
+            .expect("full_sc has mass set")
+            .dry_mass_kg = 100.5;
+        dataset
+            .set_by_id(-50, repr)
+            .expect("should set full_sc by id -50");
         assert_eq!(
-            dataset.get_by_id(-50).unwrap().mass.unwrap().dry_mass_kg,
+            dataset
+                .get_by_id(-50)
+                .expect("should get modified full_sc by id -50")
+                .mass
+                .expect("full_sc has mass set")
+                .dry_mass_kg,
             100.5,
             "value was not modified"
         );
         assert!(dataset.set_by_id(111, repr).is_err());
         // Test renaming by ID
-        dataset.lut.reid(-50, -52).unwrap();
+        dataset.lut.reid(-50, -52).expect("should reid -50 to -52");
         // Calling this a second time will lead to an error
         assert!(dataset.lut.reid(-50, -52).is_err());
         // Calling the original will lead to an error
         assert!(dataset.get_by_id(-50).is_err());
         // Check that we can fetch that data as we modified it.
         assert_eq!(
-            dataset.get_by_id(-52).unwrap().mass.unwrap().dry_mass_kg,
+            dataset
+                .get_by_id(-52)
+                .expect("should get full_sc by id -52 after reid")
+                .mass
+                .expect("full_sc has mass set")
+                .dry_mass_kg,
             100.5,
             "value not reachable after reid"
         );

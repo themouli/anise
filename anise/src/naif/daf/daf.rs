@@ -155,7 +155,7 @@ impl<R: NAIFSummaryRecord> DAF<R> {
                     kind: R::NAME,
                 })?,
         )
-        .unwrap();
+        .expect("bytes are exactly FileRecord::SIZE so read_from_bytes cannot fail");
         // Check that the endian-ness is compatible with this platform.
         file_record
             .endianness()
@@ -176,7 +176,8 @@ impl<R: NAIFSummaryRecord> DAF<R> {
                 size: self.bytes.len(),
             })
             .context(DecodingNameSnafu { kind: R::NAME })?;
-        Ok(NameRecord::read_from_bytes(rcrd_bytes).unwrap())
+        Ok(NameRecord::read_from_bytes(rcrd_bytes)
+            .expect("bytes are exactly RCRD_LEN so read_from_bytes cannot fail"))
     }
 
     /// Reads and parses the DAF summary record, starting at the provided idx (1-index!) or at the file record's forward index if no index provided.
@@ -398,27 +399,19 @@ impl<R: NAIFSummaryRecord> DAF<R> {
 
         let start = (this_summary.start_index() - 1) * DBL_SIZE;
         let end = this_summary.end_index() * DBL_SIZE;
+        let bytes_slice = self
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| DecodingError::InaccessibleBytes {
+                start,
+                end,
+                size: self.bytes.len(),
+            })
+            .context(DecodingDataSnafu { kind: R::NAME, idx })?;
         let data: &[f64] = Ref::into_ref(
-            Ref::<&[u8], [f64]>::from_bytes(
-                match self
-                    .bytes
-                    .get(start..end)
-                    .ok_or_else(|| DecodingError::InaccessibleBytes {
-                        start,
-                        end,
-                        size: self.bytes.len(),
-                    }) {
-                    Ok(it) => it,
-                    Err(source) => {
-                        return Err(DAFError::DecodingData {
-                            kind: R::NAME,
-                            idx,
-                            source,
-                        })
-                    }
-                },
-            )
-            .unwrap(),
+            Ref::<&[u8], [f64]>::from_bytes(bytes_slice)
+                .map_err(|_| DecodingError::Casting)
+                .context(DecodingDataSnafu { kind: R::NAME, idx })?,
         );
 
         // Convert it
@@ -460,7 +453,8 @@ impl<R: NAIFSummaryRecord> DAF<R> {
                 Err(e) => {
                     // At this point, we know that the bytes are accessible because the embedded `match`
                     // did not fail, so we can perform a direct access.
-                    core::str::from_utf8(&bytes_slice[..e.valid_up_to()]).unwrap()
+                    core::str::from_utf8(&bytes_slice[..e.valid_up_to()])
+                        .expect("valid_up_to() guarantees a valid UTF-8 prefix")
                 }
             };
 
@@ -474,12 +468,12 @@ impl<R: NAIFSummaryRecord> DAF<R> {
                 .find(|(_, c)| !c.is_whitespace() && *c != '\0')
             {
                 // Find last non-padding char
-                // safe to unwrap because we found at least one char above
+                // infallible: at least one non-padding char was found above
                 let (end_idx, end_char) = s
                     .char_indices()
                     .rev()
                     .find(|(_, c)| !c.is_whitespace() && *c != '\0')
-                    .unwrap();
+                    .expect("at least one non-padding char was found above");
                 let end = end_idx + end_char.len_utf8();
 
                 for c in s[start..end].chars() {
@@ -501,31 +495,32 @@ impl<R: NAIFSummaryRecord> DAF<R> {
 
     /// Writes the contents of this DAF file to a new location.
     pub fn persist<P: AsRef<Path>>(&self, path: P) -> IoResult<()> {
+        fn daf_err_to_io(e: DAFError) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        }
         let mut fs = File::create(path)?;
 
-        let mut file_rcrd = Vec::from(self.file_record().unwrap().as_bytes());
-        file_rcrd.extend(vec![
-            0x0;
-            (self.file_record().unwrap().fwrd_idx() - 1) * RCRD_LEN
-                - file_rcrd.len()
-        ]);
+        let file_record = self.file_record().map_err(daf_err_to_io)?;
+        let fwrd_idx = file_record.fwrd_idx();
+        let mut file_rcrd = Vec::from(file_record.as_bytes());
+        file_rcrd.extend(vec![0x0; (fwrd_idx - 1) * RCRD_LEN - file_rcrd.len()]);
         fs.write_all(&file_rcrd)?;
 
-        let mut daf_summary = Vec::from(self.daf_summary(None).unwrap().as_bytes());
+        let mut daf_summary = Vec::from(self.daf_summary(None).map_err(daf_err_to_io)?.as_bytes());
         // Extend with the data summaries
-        for data_summary in self.data_summaries(None).unwrap() {
+        for data_summary in self.data_summaries(None).map_err(daf_err_to_io)? {
             daf_summary.extend(data_summary.as_bytes());
         }
         // And pad with NULL
         daf_summary.extend(vec![0x0; RCRD_LEN - daf_summary.len()]);
         fs.write_all(&daf_summary)?;
 
-        let mut name_rcrd = Vec::from(self.name_record(None).unwrap().as_bytes());
+        let mut name_rcrd = Vec::from(self.name_record(None).map_err(daf_err_to_io)?.as_bytes());
         name_rcrd.extend(vec![0x0; RCRD_LEN - name_rcrd.len()]);
         fs.write_all(&name_rcrd)?;
 
         // Data starts right after the summary and name records in self.bytes
-        fs.write_all(&self.bytes[(self.file_record().unwrap().fwrd_idx() + 1) * RCRD_LEN..])
+        fs.write_all(&self.bytes[(fwrd_idx + 1) * RCRD_LEN..])
     }
 
     /// Returns an iterator over all summary data blocks.
@@ -609,12 +604,12 @@ mod daf_ut {
 
     #[test]
     fn crc32_errors() {
-        let mut traj = SPK::load("../data/gmat-hermite.bsp").unwrap();
+        let mut traj = SPK::load("../data/gmat-hermite.bsp").expect("should load gmat-hermite.bsp");
         let nominal_crc = traj.crc32();
 
         assert_eq!(
             SPK::check_then_parse(
-                file2heap!("../data/gmat-hermite.bsp").unwrap(),
+                file2heap!("../data/gmat-hermite.bsp").expect("should read gmat-hermite.bsp"),
                 nominal_crc + 1
             ),
             Err(DAFError::DAFIntegrity {
@@ -627,7 +622,10 @@ mod daf_ut {
 
         // Change the checksum of the traj and check that scrub fails
         traj.set_crc32();
-        *traj.crc32.as_mut().unwrap() = nominal_crc + 1;
+        *traj
+            .crc32
+            .as_mut()
+            .expect("crc32 was just set by set_crc32()") = nominal_crc + 1;
         assert_eq!(
             traj.scrub(),
             Err(IntegrityError::ChecksumInvalid {
@@ -639,8 +637,8 @@ mod daf_ut {
 
     #[test]
     fn summary_from_name() {
-        let epoch = Epoch::now().unwrap();
-        let traj = SPK::load("../data/gmat-hermite.bsp").unwrap();
+        let epoch = Epoch::now().expect("should get current epoch");
+        let traj = SPK::load("../data/gmat-hermite.bsp").expect("should load gmat-hermite.bsp");
 
         assert_eq!(
             traj.summary_from_name_at_epoch("name", epoch),
@@ -661,8 +659,12 @@ mod daf_ut {
             })
         );
 
-        if traj.nth_data::<HermiteSetType13>(None, 0).unwrap()
-            != traj.data_from_name("SPK_SEGMENT").unwrap()
+        if traj
+            .nth_data::<HermiteSetType13>(None, 0)
+            .expect("should get 0th Hermite data set")
+            != traj
+                .data_from_name("SPK_SEGMENT")
+                .expect("should get data for SPK_SEGMENT")
         {
             // We cannot user assert_eq! because the NAIF Data Set do not (and should not) impl Debug
             // These data sets are the full record!
@@ -726,9 +728,10 @@ mod daf_ut {
         // Add Name Record (Rec 4) just in case
         bytes.extend(vec![0u8; 1024]);
 
-        let daf = super::DAF::<SPKSummaryRecord>::parse(&bytes[..]).unwrap();
+        let daf = super::DAF::<SPKSummaryRecord>::parse(&bytes[..])
+            .expect("should parse constructed DAF bytes");
 
-        let comments = daf.comments().unwrap();
+        let comments = daf.comments().expect("should extract comments from DAF");
 
         if let Some(c) = comments {
             assert_eq!(

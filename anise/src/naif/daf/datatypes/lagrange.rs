@@ -224,15 +224,25 @@ pub struct LagrangeSetType9<'a> {
 
 impl fmt::Display for LagrangeSetType9<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Lagrange Type 9 from {:E} to {:E} with degree {} ({} items, {} epoch directories)",
-            Epoch::from_et_seconds(*self.epoch_data.first().unwrap()),
-            Epoch::from_et_seconds(*self.epoch_data.last().unwrap()),
-            self.degree,
-            self.epoch_data.len(),
-            self.epoch_registry.len()
-        )
+        if let (Some(&first), Some(&last)) = (self.epoch_data.first(), self.epoch_data.last()) {
+            write!(
+                f,
+                "Lagrange Type 9 from {:E} to {:E} with degree {} ({} items, {} epoch directories)",
+                Epoch::from_et_seconds(first),
+                Epoch::from_et_seconds(last),
+                self.degree,
+                self.epoch_data.len(),
+                self.epoch_registry.len()
+            )
+        } else {
+            write!(
+                f,
+                "Lagrange Type 9 (empty) with degree {} ({} items, {} epoch directories)",
+                self.degree,
+                self.epoch_data.len(),
+                self.epoch_registry.len()
+            )
+        }
     }
 }
 
@@ -256,11 +266,30 @@ impl<'a> NAIFDataSet<'a> for LagrangeSetType9<'a> {
         let degree = slice[slice.len() - 2] as usize;
         // NOTE: The ::SIZE returns the C representation memory size of this, but we only want the number of doubles.
         let state_data_end_idx = PositionVelocityRecord::SIZE / DBL_SIZE * num_records;
-        let state_data = slice.get(0..state_data_end_idx).unwrap();
+        let state_data =
+            slice
+                .get(0..state_data_end_idx)
+                .ok_or(DecodingError::InaccessibleBytes {
+                    start: 0,
+                    end: state_data_end_idx,
+                    size: slice.len(),
+                })?;
         let epoch_data_end_idx = state_data_end_idx + num_records;
-        let epoch_data = slice.get(state_data_end_idx..epoch_data_end_idx).unwrap();
+        let epoch_data = slice.get(state_data_end_idx..epoch_data_end_idx).ok_or(
+            DecodingError::InaccessibleBytes {
+                start: state_data_end_idx,
+                end: epoch_data_end_idx,
+                size: slice.len(),
+            },
+        )?;
         // And the epoch directory is whatever remains minus the metadata
-        let epoch_registry = slice.get(epoch_data_end_idx..slice.len() - 2).unwrap();
+        let epoch_registry = slice.get(epoch_data_end_idx..slice.len() - 2).ok_or(
+            DecodingError::InaccessibleBytes {
+                start: epoch_data_end_idx,
+                end: slice.len() - 2,
+                size: slice.len(),
+            },
+        )?;
 
         Ok(Self {
             degree,
@@ -294,13 +323,18 @@ impl<'a> NAIFDataSet<'a> for LagrangeSetType9<'a> {
             return Err(InterpolationError::MissingInterpolationData { epoch });
         }
         // Check that we even have interpolation data for that time
+        // SAFETY: epoch_data is non-empty per the check above
+        let last_et = *self
+            .epoch_data
+            .last()
+            .expect("epoch_data is non-empty per the check above");
         if epoch.to_et_seconds() < self.epoch_data[0] - 1e-7
-            || epoch.to_et_seconds() > *self.epoch_data.last().unwrap() + 1e-7
+            || epoch.to_et_seconds() > last_et + 1e-7
         {
             return Err(InterpolationError::NoInterpolationData {
                 req: epoch,
                 start: Epoch::from_et_seconds(self.epoch_data[0]),
-                end: Epoch::from_et_seconds(*self.epoch_data.last().unwrap()),
+                end: Epoch::from_et_seconds(last_et),
             });
         }
 
@@ -507,25 +541,33 @@ mod ut_lagrange {
 
         // Test exact match
         let epoch = Epoch::from_et_seconds(60.0);
-        let result = dataset.evaluate(epoch, &summary).unwrap();
+        let result = dataset
+            .evaluate(epoch, &summary)
+            .expect("should evaluate Lagrange Type 8 at epoch 60.0");
         assert!((result.0.x - (60.0 * 60.0 + 60.0 + 1.0)).abs() < 1e-12);
         assert!((result.1.x - (2.0 * 60.0 + 1.0)).abs() < 1e-12);
 
         // Test interpolation (mid-point of an interval)
         let epoch = Epoch::from_et_seconds(90.0);
-        let result = dataset.evaluate(epoch, &summary).unwrap();
+        let result = dataset
+            .evaluate(epoch, &summary)
+            .expect("should evaluate Lagrange Type 8 at epoch 90.0");
         // Since motion is quadratic and degree is 3, Lagrange should be exact.
         assert!((result.0.x - (90.0 * 90.0 + 90.0 + 1.0)).abs() < 1e-12);
         assert!((result.1.x - (2.0 * 90.0 + 1.0)).abs() < 1e-12);
 
         // Test near start
         let epoch = Epoch::from_et_seconds(10.0);
-        let result = dataset.evaluate(epoch, &summary).unwrap();
+        let result = dataset
+            .evaluate(epoch, &summary)
+            .expect("should evaluate Lagrange Type 8 near start");
         assert!((result.0.x - (10.0 * 10.0 + 10.0 + 1.0)).abs() < 1e-12);
 
         // Test near end
         let epoch = Epoch::from_et_seconds((num_records as f64 - 1.5) * h);
-        let result = dataset.evaluate(epoch, &summary).unwrap();
+        let result = dataset
+            .evaluate(epoch, &summary)
+            .expect("should evaluate Lagrange Type 8 near end");
         let et = (num_records as f64 - 1.5) * h;
         assert!((result.0.x - (et * et + et + 1.0)).abs() < 1e-12);
     }
@@ -568,12 +610,16 @@ mod ut_lagrange {
 
         // Test exact match
         let epoch = Epoch::from_et_seconds(10.0);
-        let result = dataset.evaluate(epoch, &summary).unwrap();
+        let result = dataset
+            .evaluate(epoch, &summary)
+            .expect("should evaluate Lagrange Type 9 at epoch 10.0");
         assert_eq!(result.0.x, 10.0);
 
         // Test interpolation
         let epoch = Epoch::from_et_seconds(10.5);
-        let result = dataset.evaluate(epoch, &summary).unwrap();
+        let result = dataset
+            .evaluate(epoch, &summary)
+            .expect("should evaluate Lagrange Type 9 at epoch 10.5");
         assert_eq!(result.0.x, 10.5);
         assert_eq!(result.0.y, 21.0);
 
@@ -585,14 +631,18 @@ mod ut_lagrange {
         // Slice: 99..=198.
         // 99.5 is > epoch_data[99] (99.0).
         let epoch = Epoch::from_et_seconds(99.5);
-        let result = dataset.evaluate(epoch, &summary).unwrap();
+        let result = dataset
+            .evaluate(epoch, &summary)
+            .expect("should evaluate Lagrange Type 9 at epoch 99.5");
         assert_eq!(result.0.x, 99.5);
 
         // Target: 100.5.
         // partition_point(|x| x < 100.5): 1.
         // Same slice. 100.5 is in 99..=198.
         let epoch = Epoch::from_et_seconds(100.5);
-        let result = dataset.evaluate(epoch, &summary).unwrap();
+        let result = dataset
+            .evaluate(epoch, &summary)
+            .expect("should evaluate Lagrange Type 9 at epoch 100.5");
         assert_eq!(result.0.x, 100.5);
 
         // Target: 200.5
@@ -601,7 +651,9 @@ mod ut_lagrange {
         // start = 199.
         // Slice 199..=249.
         let epoch = Epoch::from_et_seconds(200.5);
-        let result = dataset.evaluate(epoch, &summary).unwrap();
+        let result = dataset
+            .evaluate(epoch, &summary)
+            .expect("should evaluate Lagrange Type 9 at epoch 200.5");
         assert_eq!(result.0.x, 200.5);
     }
 }

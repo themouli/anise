@@ -105,7 +105,7 @@ pub enum DecodingError {
     },
     #[snafu(display("decoding DER failed: {err}"))]
     DecodingDer { err: DerError },
-    #[snafu(display("somehow casting the data failed"))]
+    #[snafu(display("byte slice could not be cast to target type (alignment or size mismatch)"))]
     Casting,
     #[snafu(display("could not load ANISE data version {got}, expected {exp}"))]
     AniseVersion { got: Semver, exp: Semver },
